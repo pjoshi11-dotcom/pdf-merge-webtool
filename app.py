@@ -1,6 +1,10 @@
 import streamlit as st
-from pypdf import PdfReader, PdfWriter
+from pypdf import PdfWriter
 from io import BytesIO
+import sys
+
+# Helpful for larger PDFs / deep bookmark trees
+sys.setrecursionlimit(max(5000, sys.getrecursionlimit() * 5))
 
 st.set_page_config(page_title="PDF Merge Tool", layout="centered")
 st.title("PDF Merge Tool")
@@ -31,20 +35,25 @@ if uploaded_files:
 
         writer = PdfWriter()
 
-        for _, pdf_file in sorted_files:
-            reader = PdfReader(pdf_file)
-            for page in reader.pages:
-                writer.add_page(page)
+        try:
+            for _, pdf_file in sorted_files:
+                pdf_file.seek(0)
+                # This preserves bookmarks/outlines where available
+                writer.append(pdf_file, import_outline=True)
 
-        output = BytesIO()
-        writer.write(output)
-        output.seek(0)
+            output = BytesIO()
+            writer.write(output)
+            writer.close()
+            output.seek(0)
 
-        st.success("PDF merged successfully!")
+            st.success("PDF merged successfully with bookmarks preserved where available!")
 
-        st.download_button(
-            label="Download Merged PDF",
-            data=output,
-            file_name="Merged_Output.pdf",
-            mime="application/pdf"
-        )
+            st.download_button(
+                label="Download Merged PDF",
+                data=output,
+                file_name="Merged_Output.pdf",
+                mime="application/pdf"
+            )
+
+        except Exception as e:
+            st.error(f"Error while merging PDFs: {e}")
