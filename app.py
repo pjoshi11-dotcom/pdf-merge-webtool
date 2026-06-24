@@ -4,7 +4,7 @@ from io import BytesIO
 import sys
 
 # Helpful for larger PDFs / deep bookmark trees
-sys.setrecursionlimit(max(5000, sys.getrecursionlimit() * 5))
+sys.setrecursionlimit(5000)
 
 st.set_page_config(page_title="PDF Merge Tool", layout="centered")
 st.title("PDF Merge Tool")
