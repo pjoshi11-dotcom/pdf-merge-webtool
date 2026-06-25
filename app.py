@@ -15,12 +15,15 @@ def safe_filename(name: str) -> str:
     return cleaned[:120] or 'Output'
 
 
-def flatten_outline(outline, reader, level=1, result=None):
+def parse_outline_nodes(outline, reader, level=1, parent_id=None, result=None):
+    """Parse pypdf outline into ordered nodes while preserving parent-child relationships."""
     if result is None:
         result = []
+    last_node_id = None
     for item in outline:
         if isinstance(item, list):
-            flatten_outline(item, reader, level + 1, result)
+            child_parent = last_node_id if last_node_id is not None else parent_id
+            parse_outline_nodes(item, reader, level + 1, child_parent, result)
         else:
             try:
                 title = getattr(item, 'title', None) or item.get('/Title')
@@ -31,33 +34,43 @@ def flatten_outline(outline, reader, level=1, result=None):
             except Exception:
                 page_num = None
             if title is not None and page_num is not None and page_num >= 0:
-                result.append({'title': str(title), 'page': int(page_num), 'level': int(level)})
+                ancestors = []
+                anc = parent_id
+                while anc is not None:
+                    ancestors.append(anc)
+                    anc = result[anc]['parent_id']
+                node_id = len(result)
+                result.append({
+                    'id': node_id,
+                    'title': str(title),
+                    'page': int(page_num),
+                    'level': int(level),
+                    'parent_id': parent_id,
+                    'ancestors': ancestors,  # nearest parent first
+                })
+                last_node_id = node_id
     return result
 
 
-def subset_bookmarks(bookmarks: List[Dict[str, Any]], start_page: int, end_page: int):
-    subset = [bm.copy() for bm in bookmarks if start_page <= bm['page'] < end_page]
-    if not subset:
-        return []
-    min_level = min(bm['level'] for bm in subset)
-    for bm in subset:
-        bm['adj_page'] = bm['page'] - start_page
-        bm['adj_level'] = bm['level'] - min_level + 1
+def subset_bookmarks(nodes: List[Dict[str, Any]], start_page: int, end_page: int):
+    subset = [dict(n) for n in nodes if start_page <= n['page'] < end_page]
+    for n in subset:
+        n['adj_page'] = n['page'] - start_page
     return subset
 
 
-def add_bookmarks_to_writer(writer: PdfWriter, bookmarks_subset: List[Dict[str, Any]]):
-    if not bookmarks_subset:
+def add_bookmarks_to_writer(writer: PdfWriter, subset_nodes: List[Dict[str, Any]]):
+    if not subset_nodes:
         return
-    parents_by_level = {}
-    for bm in bookmarks_subset:
-        level = bm['adj_level']
-        parent = parents_by_level.get(level - 1)
-        ref = writer.add_outline_item(title=bm['title'], page_number=bm['adj_page'], parent=parent)
-        parents_by_level[level] = ref
-        stale = [k for k in parents_by_level if k > level]
-        for k in stale:
-            parents_by_level.pop(k, None)
+    added_refs = {}
+    for n in subset_nodes:
+        parent_ref = None
+        for anc in n['ancestors']:
+            if anc in added_refs:
+                parent_ref = added_refs[anc]
+                break
+        ref = writer.add_outline_item(title=n['title'], page_number=n['adj_page'], parent=parent_ref)
+        added_refs[n['id']] = ref
 
 
 def merge_files_with_bookmarks(sorted_files):
@@ -68,7 +81,6 @@ def merge_files_with_bookmarks(sorted_files):
             writer.append(up_file, import_outline=True)
         output = BytesIO()
         writer.write(output)
-        output.seek(0)
         return output.getvalue()
     finally:
         try:
@@ -77,73 +89,158 @@ def merge_files_with_bookmarks(sorted_files):
             pass
 
 
-def split_into_two_parts(pdf_bytes: bytes, bookmarks: List[Dict[str, Any]], selected_idx: int):
+def create_parts_from_split_points(pdf_bytes: bytes, nodes: List[Dict[str, Any]], selected_node_ids: List[int]):
     reader = PdfReader(BytesIO(pdf_bytes))
     total_pages = len(reader.pages)
-    selected_bm = bookmarks[selected_idx]
-    split_page = selected_bm['page']
-    if split_page <= 0 or split_page >= total_pages:
-        raise ValueError("Selected bookmark must be after page 1 and before the last page to create Part 1 and Part 2.")
 
-    part1_writer = PdfWriter()
-    for page_no in range(0, split_page):
-        part1_writer.add_page(reader.pages[page_no])
-    add_bookmarks_to_writer(part1_writer, subset_bookmarks(bookmarks, 0, split_page))
-    part1_output = BytesIO()
-    part1_writer.write(part1_output)
-    part1_bytes = part1_output.getvalue()
-    try:
-        part1_writer.close()
-    except Exception:
-        pass
+    selected_pages = sorted(set(nodes[nid]['page'] for nid in selected_node_ids if 0 <= nodes[nid]['page'] < total_pages))
+    cut_points = [p for p in selected_pages if 0 < p < total_pages]
+    if not cut_points:
+        raise ValueError("Selected split points do not create any valid cut in the document.")
 
-    part2_writer = PdfWriter()
-    for page_no in range(split_page, total_pages):
-        part2_writer.add_page(reader.pages[page_no])
-    add_bookmarks_to_writer(part2_writer, subset_bookmarks(bookmarks, split_page, total_pages))
-    part2_output = BytesIO()
-    part2_writer.write(part2_output)
-    part2_bytes = part2_output.getvalue()
-    try:
-        part2_writer.close()
-    except Exception:
-        pass
+    boundaries = [0] + cut_points + [total_pages]
+    segments = [(boundaries[i], boundaries[i + 1]) for i in range(len(boundaries) - 1) if boundaries[i] < boundaries[i + 1]]
+    outputs = []
 
-    return part1_bytes, part2_bytes, selected_bm, split_page, total_pages
+    for idx, (start_page, end_page) in enumerate(segments, start=1):
+        writer = PdfWriter()
+        for page_no in range(start_page, end_page):
+            writer.add_page(reader.pages[page_no])
+        subset = subset_bookmarks(nodes, start_page, end_page)
+        add_bookmarks_to_writer(writer, subset)
+        output = BytesIO()
+        writer.write(output)
+        outputs.append({
+            'part_no': idx,
+            'start_page': start_page + 1,
+            'end_page': end_page,
+            'bytes': output.getvalue(),
+        })
+        try:
+            writer.close()
+        except Exception:
+            pass
 
+    return outputs, cut_points, total_pages
+
+
+def init_state():
+    defaults = {
+        'split_nodes': [],
+        'split_pdf_bytes': None,
+        'split_file_token': None,
+        'split_selected_ids': [],
+        'split_outputs': None,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def reset_split_state(file_token=None, pdf_bytes=None):
+    st.session_state['split_nodes'] = []
+    st.session_state['split_selected_ids'] = []
+    st.session_state['split_outputs'] = None
+    st.session_state['split_file_token'] = file_token
+    st.session_state['split_pdf_bytes'] = pdf_bytes
+
+
+def node_label(n: Dict[str, Any]) -> str:
+    indent = '  ' * max(0, n['level'] - 1)
+    return f"{indent}P{n['page'] + 1} | L{n['level']} | {n['title']}"
+
+
+def top_level_nodes(nodes):
+    return [n for n in nodes if n['parent_id'] is None]
+
+
+def children_of(nodes, parent_id):
+    return [n for n in nodes if n['parent_id'] == parent_id]
+
+
+def node_matches_filter(node, query: str) -> bool:
+    return query in node['title'].lower() if query else True
+
+
+def subtree_has_match(nodes_map, node_id, query: str) -> bool:
+    node = nodes_map[node_id]
+    if node_matches_filter(node, query):
+        return True
+    for child_id in [n['id'] for n in nodes_map.values() if n['parent_id'] == node_id]:
+        if subtree_has_match(nodes_map, child_id, query):
+            return True
+    return False
+
+
+def render_tree_section(nodes: List[Dict[str, Any]], query: str):
+    # Near-desktop replica: top-level expanders + nested indented items with add buttons.
+    if not nodes:
+        st.info("No bookmarks loaded yet.")
+        return
+
+    nodes_map = {n['id']: n for n in nodes}
+    selected_ids = set(st.session_state['split_selected_ids'])
+    expand_all = st.checkbox("Expand all top-level sections", value=False, key="expand_all_sections")
+
+    for root in top_level_nodes(nodes):
+        if not subtree_has_match(nodes_map, root['id'], query):
+            continue
+        with st.expander(f"P{root['page'] + 1} | {root['title']}", expanded=expand_all):
+            render_node_recursive(nodes_map, root['id'], query, selected_ids)
+
+
+def render_node_recursive(nodes_map, node_id, query: str, selected_ids: set):
+    node = nodes_map[node_id]
+    if node['parent_id'] is not None and subtree_has_match(nodes_map, node_id, query):
+        c1, c2 = st.columns([8, 2])
+        c1.write(f"{'— ' * max(0, node['level'] - 2)}P{node['page'] + 1} | {node['title']}")
+        if node_id in selected_ids:
+            c2.caption("Added")
+        else:
+            if c2.button("Add", key=f"add_node_{node_id}"):
+                st.session_state['split_selected_ids'] = sorted(set(st.session_state['split_selected_ids'] + [node_id]), key=lambda nid: nodes_map[nid]['page'])
+                st.rerun()
+
+    children = [n for n in nodes_map.values() if n['parent_id'] == node_id and subtree_has_match(nodes_map, n['id'], query)]
+    for child in sorted(children, key=lambda x: (x['page'], x['id'])):
+        render_node_recursive(nodes_map, child['id'], query, selected_ids)
+
+
+init_state()
 
 st.title("PDF Merge & Split Tool")
-st.caption("Merge PDFs with bookmarks preserved, or split one MRB PDF into Part 1 and Part 2 based on a selected bookmark.")
-
-# -------- session state --------
-for key, default in {
-    'split_bookmarks': [],
-    'split_pdf_bytes': None,
-    'split_results': None,
-    'split_file_token': None,
-}.items():
-    if key not in st.session_state:
-        st.session_state[key] = default
+st.caption("Web replica of the desktop tool: merge with bookmarks preserved, search bookmarks, browse hierarchy, and split into multiple parts using one or more split points.")
 
 merge_tab, split_tab = st.tabs(["Merge PDFs", "Split by Bookmark"])
 
 with merge_tab:
     st.subheader("Merge PDFs")
-    uploaded_files = st.file_uploader("Upload PDF files for merge", type=["pdf"], accept_multiple_files=True, key="merge_uploader")
+    uploaded_files = st.file_uploader(
+        "Upload PDF files for merge",
+        type=["pdf"],
+        accept_multiple_files=True,
+        key="merge_uploader"
+    )
     output_merge_name = st.text_input("Merged output file name", value="Merged_Output", key="merge_name")
 
     if uploaded_files:
         st.markdown("### Set merge sequence")
-        file_orders, used = [], []
-        cols = st.columns([5, 2])
-        cols[0].markdown("**File**")
-        cols[1].markdown("**Sequence**")
+        file_orders = []
+        used = []
+        hdr = st.columns([6, 2])
+        hdr[0].markdown("**File**")
+        hdr[1].markdown("**Sequence**")
         for i, file in enumerate(uploaded_files, start=1):
-            row = st.columns([5, 2])
+            row = st.columns([6, 2])
             row[0].write(file.name)
             seq = row[1].number_input(
-                f"Sequence for {file.name}", min_value=1, max_value=len(uploaded_files), value=i, step=1,
-                key=f"merge_seq_{file.name}_{i}", label_visibility="collapsed"
+                f"Sequence for {file.name}",
+                min_value=1,
+                max_value=len(uploaded_files),
+                value=i,
+                step=1,
+                key=f"merge_seq_{file.name}_{i}",
+                label_visibility="collapsed"
             )
             used.append(seq)
             file_orders.append((seq, file))
@@ -167,20 +264,22 @@ with merge_tab:
 
 with split_tab:
     st.subheader("Split by Bookmark")
-    split_file = st.file_uploader("Upload one MRB PDF for split", type=["pdf"], accept_multiple_files=False, key="split_uploader")
+    split_file = st.file_uploader(
+        "Upload one MRB PDF for split",
+        type=["pdf"],
+        accept_multiple_files=False,
+        key="split_uploader"
+    )
     output_base_name = st.text_input("Output base name", value="Split_Output", key="split_name")
 
     if split_file is not None:
         current_token = f"{split_file.name}_{split_file.size}"
         if st.session_state['split_file_token'] != current_token:
-            st.session_state['split_file_token'] = current_token
-            st.session_state['split_bookmarks'] = []
-            st.session_state['split_pdf_bytes'] = split_file.getvalue()
-            st.session_state['split_results'] = None
+            reset_split_state(file_token=current_token, pdf_bytes=split_file.getvalue())
 
-        col_a, col_b = st.columns([1, 4])
-        load_clicked = col_a.button("Load Bookmarks", key="load_bookmarks_btn")
-        col_b.caption("Selected bookmark will become the start of Part 2. Part 1 will contain everything before it.")
+        top_btns = st.columns([1, 5])
+        load_clicked = top_btns[0].button("Load Bookmarks", key="load_bookmarks_btn")
+        top_btns[1].caption("Add one or more split points. Each selected bookmark becomes a cut point. Example: choose Section C and Section E → Part 1, Part 2, Part 3.")
 
         if load_clicked:
             try:
@@ -188,73 +287,86 @@ with split_tab:
                 reader = PdfReader(BytesIO(pdf_bytes))
                 outline = getattr(reader, 'outline', None)
                 if outline is None:
-                    st.session_state['split_bookmarks'] = []
+                    st.session_state['split_nodes'] = []
                     st.warning("No bookmarks/outlines found in this PDF.")
                 else:
-                    bookmarks = flatten_outline(outline, reader)
-                    st.session_state['split_bookmarks'] = bookmarks
-                    st.session_state['split_results'] = None
-                    st.success(f"Loaded {len(bookmarks)} bookmark(s).")
+                    st.session_state['split_nodes'] = parse_outline_nodes(outline, reader)
+                    st.session_state['split_selected_ids'] = []
+                    st.session_state['split_outputs'] = None
+                    st.success(f"Loaded {len(st.session_state['split_nodes'])} bookmark(s).")
             except Exception as e:
-                st.session_state['split_bookmarks'] = []
-                st.session_state['split_results'] = None
+                st.session_state['split_nodes'] = []
+                st.session_state['split_selected_ids'] = []
+                st.session_state['split_outputs'] = None
                 st.error(f"Unable to read bookmarks: {e}")
 
-        bookmarks = st.session_state.get('split_bookmarks', [])
-        pdf_bytes = st.session_state.get('split_pdf_bytes')
+        nodes = st.session_state['split_nodes']
+        pdf_bytes = st.session_state['split_pdf_bytes']
 
-        if bookmarks and pdf_bytes:
-            options = [f"L{bm['level']} | P{bm['page'] + 1} | {bm['title']}" for bm in bookmarks]
-            selected_label = st.selectbox("Select bookmark from where Part 2 should start", options, key="split_bookmark_select")
-            selected_idx = options.index(selected_label)
-            bm = bookmarks[selected_idx]
-            st.info(
-                f"Split point selected: **{bm['title']}** (starts at page **{bm['page'] + 1}**).\n\n"
-                f"Part 1 = pages 1 to {bm['page']} | Part 2 = page {bm['page'] + 1} onward"
-            )
+        if nodes and pdf_bytes:
+            st.markdown("### Search bookmarks")
+            search_cols = st.columns([3, 2, 1])
+            search_text = search_cols[0].text_input("Search text", value="", key="split_search_text")
+            matches = [n for n in nodes if search_text.lower() in n['title'].lower()] if search_text.strip() else []
+            search_options = [node_label(n) for n in matches]
+            selected_match = search_cols[1].selectbox("Matches", options=search_options if search_options else ["No matches"], key="split_search_match")
+            if search_cols[2].button("Add Match", key="add_match_btn") and matches:
+                match_node = matches[search_options.index(selected_match)]
+                st.session_state['split_selected_ids'] = sorted(set(st.session_state['split_selected_ids'] + [match_node['id']]), key=lambda nid: next(x['page'] for x in nodes if x['id'] == nid))
+                st.rerun()
 
-            if st.button("Create Part 1 + Part 2", type="primary", key="split_create_btn"):
+            st.markdown("### Bookmark hierarchy")
+            render_tree_section(nodes, search_text.strip().lower())
+
+            st.markdown("### Selected split points")
+            selected_nodes = [n for n in nodes if n['id'] in st.session_state['split_selected_ids']]
+            selected_nodes = sorted(selected_nodes, key=lambda x: (x['page'], x['id']))
+            if selected_nodes:
+                for n in selected_nodes:
+                    c1, c2 = st.columns([8, 1])
+                    c1.write(f"P{n['page'] + 1} | L{n['level']} | {n['title']}")
+                    if c2.button("Remove", key=f"remove_selected_{n['id']}"):
+                        st.session_state['split_selected_ids'] = [x for x in st.session_state['split_selected_ids'] if x != n['id']]
+                        st.session_state['split_outputs'] = None
+                        st.rerun()
+            else:
+                st.info("No split points added yet.")
+
+            action_cols = st.columns([1, 1, 6])
+            if action_cols[0].button("Clear Split Points", key="clear_split_points_btn"):
+                st.session_state['split_selected_ids'] = []
+                st.session_state['split_outputs'] = None
+                st.rerun()
+            if action_cols[1].button("Create All Parts", type="primary", key="create_all_parts_btn"):
                 try:
-                    part1_bytes, part2_bytes, selected_bm, split_page, total_pages = split_into_two_parts(pdf_bytes, bookmarks, selected_idx)
-                    st.session_state['split_results'] = {
-                        'part1_bytes': part1_bytes,
-                        'part2_bytes': part2_bytes,
-                        'selected_title': selected_bm['title'],
-                        'split_page': split_page,
+                    outputs, cut_points, total_pages = create_parts_from_split_points(pdf_bytes, nodes, st.session_state['split_selected_ids'])
+                    st.session_state['split_outputs'] = {
+                        'outputs': outputs,
+                        'cut_points': cut_points,
                         'total_pages': total_pages,
                         'base_name': safe_filename(output_base_name),
                     }
                 except Exception as e:
-                    st.session_state['split_results'] = None
+                    st.session_state['split_outputs'] = None
                     st.error(f"Error while splitting PDF: {e}")
 
-            results = st.session_state.get('split_results')
+            results = st.session_state.get('split_outputs')
             if results:
-                st.success("Split completed successfully. Bookmarks preserved in both outputs where available.")
-                dl1, dl2 = st.columns(2)
-                dl1.download_button(
-                    label="Download Part 1",
-                    data=results['part1_bytes'],
-                    file_name=f"{results['base_name']}_Part1.pdf",
-                    mime="application/pdf",
-                    key="download_part1_pdf",
-                    on_click="ignore"
-                )
-                dl2.download_button(
-                    label="Download Part 2",
-                    data=results['part2_bytes'],
-                    file_name=f"{results['base_name']}_Part2.pdf",
-                    mime="application/pdf",
-                    key="download_part2_pdf",
-                    on_click="ignore"
-                )
-                st.caption(
-                    f"Selected bookmark: {results['selected_title']} | "
-                    f"Part 1 pages: 1 to {results['split_page']} | "
-                    f"Part 2 pages: {results['split_page'] + 1} to {results['total_pages']}"
-                )
+                st.success(f"Split completed successfully. Created {len(results['outputs'])} parts. Relevant bookmarks preserved in each output where available.")
+                info_text = " | ".join([f"Part {o['part_no']}: pages {o['start_page']} to {o['end_page']}" for o in results['outputs']])
+                st.caption(info_text)
+
+                for out in results['outputs']:
+                    st.download_button(
+                        label=f"Download Part {out['part_no']}",
+                        data=out['bytes'],
+                        file_name=f"{results['base_name']}_Part{out['part_no']}.pdf",
+                        mime="application/pdf",
+                        key=f"download_part_{out['part_no']}",
+                        on_click="ignore"
+                    )
         elif split_file is not None:
             st.caption("Click 'Load Bookmarks' to read available bookmarks from the uploaded PDF.")
 
 st.divider()
-st.caption("Note: Streamlit web upload/runtime limits still apply for very large PDFs. Use the desktop EXE for large MRB files.")
+st.caption("Note: This web version closely replicates the desktop features, but Streamlit upload/runtime limits still apply for very large MRB PDFs. For large files, the desktop EXE remains the best option.")
